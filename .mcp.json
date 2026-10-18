@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "local-blueteam": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/home/agent/tools/local-vibes/dist/index.js"],
+      "env": { "LOCAL_VIBES_BASE_URL": "http://100.81.179.123:11434/v1",
+               "LOCAL_VIBES_MODEL": "blueteam",
+               "LOCAL_VIBES_ALLOW_BASH": "0",
+               "LOCAL_VIBES_MAX_ITERS": "12" }
+    },
+    "local-redteam": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/home/agent/tools/local-vibes/dist/index.js"],
+      "env": { "LOCAL_VIBES_BASE_URL": "http://100.81.179.123:11434/v1",
+               "LOCAL_VIBES_MODEL": "redteam",
+               "LOCAL_VIBES_ALLOW_BASH": "1",
+               "LOCAL_VIBES_MAX_ITERS": "25" }
+    }
+  }
+}
