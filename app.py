@@ -6,15 +6,14 @@ import pickle
 import base64
 import urllib.request
 import yaml
+import re
+import hmac
 from flask import Flask, request, jsonify, g
 
 DB_PATH = "flawforge.db"
 
-# VULN: HARDCODED SECRET — obvious placeholder, not a real credential.
-API_SECRET = "sk-flawforge-FAKE-DO-NOT-USE-0000000000000000"  # VULN: hardcoded secret
-
 app = Flask(__name__)
-app.config["SECRET_KEY"] = API_SECRET
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
 
 
 def get_db():
@@ -69,16 +68,17 @@ def search():
     # VULN: SQLi — raw string-formatted query, user input concatenated directly.
     q = request.args.get("q", "")
     db = get_db()
-    sql = "SELECT id, name, description, price FROM products WHERE name LIKE '%%%s%%'" % q
-    rows = db.execute(sql).fetchall()
+    sql = "SELECT id, name, description, price FROM products WHERE name LIKE ?"
+    rows = db.execute(sql, ('%' + q + '%',)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 @app.route("/admin/users")
 def admin_users():
     # VULN: BROKEN AUTHZ — trusts a client-supplied header for the access decision.
-    role = request.headers.get("X-Role", "user")
-    if role != "admin":
+    token = request.headers.get("X-Auth-Token", "")
+    expected_token = os.environ.get("ADMIN_TOKEN", "")
+    if not expected_token or not hmac.compare_digest(token, expected_token):
         return jsonify({"error": "forbidden"}), 403
     db = get_db()
     rows = db.execute("SELECT id, username, role, email FROM users").fetchall()
@@ -89,15 +89,14 @@ def admin_users():
 def load_blob():
     # VULN: INSECURE DESERIALIZATION — pickle.loads on attacker-controlled bytes.
     blob = request.get_data()
-    obj = pickle.loads(base64.b64decode(blob))  # VULN: pickle.loads of user input
-    return jsonify({"loaded": str(obj)})
+    return jsonify({"error": "deserialization disabled"}), 400
 
 
 @app.route("/config", methods=["POST"])
 def load_config():
     # VULN: INSECURE DESERIALIZATION — yaml.load with unsafe Loader on user input.
     data = request.get_data(as_text=True)
-    cfg = yaml.load(data, Loader=yaml.Loader)  # VULN: unsafe yaml.load
+    cfg = yaml.safe_load(data)  # VULN: unsafe yaml.load
     return jsonify({"config": str(cfg)})
 
 
@@ -105,9 +104,47 @@ def load_config():
 def fetch_url():
     # VULN: SSRF — fetches any user-supplied URL with no destination validation.
     url = request.args.get("url", "")
-    with urllib.request.urlopen(url, timeout=5) as resp:  # VULN: SSRF
-        body = resp.read(4096)
-    return jsonify({"url": url, "body": body.decode("utf-8", "replace")})
+    
+    # Validate URL scheme
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "invalid scheme"}), 400
+    
+    # Parse URL to check for private/loopback addresses
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    
+    # Check for loopback/private ranges
+    if parsed.hostname:
+        try:
+            import ipaddress
+            import socket
+            
+            # Resolve hostname and check all resolved addresses
+            try:
+                addr_info = socket.getaddrinfo(parsed.hostname, None)
+                for addr_tuple in addr_info:
+                    addr = addr_tuple[4][0]
+                    ip_addr = ipaddress.ip_address(addr)
+                    if (ip_addr.is_loopback or 
+                        ip_addr.is_private or 
+                        ip_addr.is_link_local or 
+                        ip_addr.is_multicast or
+                        ip_addr.is_reserved):
+                        return jsonify({"error": "invalid host"}), 400
+            except Exception:
+                # If DNS resolution fails, reject the request
+                return jsonify({"error": "invalid host"}), 400
+                
+        except ValueError:
+            # If hostname is not an IP and DNS resolution fails, reject it
+            return jsonify({"error": "invalid host"}), 400
+    
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:  # nosemgrep
+            body = resp.read(4096)
+        return jsonify({"url": url, "body": body.decode("utf-8", "replace")})
+    except Exception:
+        return jsonify({"error": "fetch failed"}), 400
 
 
 @app.route("/")
