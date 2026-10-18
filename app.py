@@ -2,11 +2,8 @@
 # Each route plants exactly one labeled vulnerability for pipeline testing.
 import os
 import sqlite3
-import pickle
-import base64
 import urllib.request
 import yaml
-import re
 import hmac
 from flask import Flask, request, jsonify, g
 
@@ -65,7 +62,6 @@ def seed():
 
 @app.route("/search")
 def search():
-    # VULN: SQLi — raw string-formatted query, user input concatenated directly.
     q = request.args.get("q", "")
     db = get_db()
     sql = "SELECT id, name, description, price FROM products WHERE name LIKE ?"
@@ -75,7 +71,6 @@ def search():
 
 @app.route("/admin/users")
 def admin_users():
-    # VULN: BROKEN AUTHZ — trusts a client-supplied header for the access decision.
     token = request.headers.get("X-Auth-Token", "")
     expected_token = os.environ.get("ADMIN_TOKEN", "")
     if not expected_token or not hmac.compare_digest(token, expected_token):
@@ -87,22 +82,22 @@ def admin_users():
 
 @app.route("/load", methods=["POST"])
 def load_blob():
-    # VULN: INSECURE DESERIALIZATION — pickle.loads on attacker-controlled bytes.
     blob = request.get_data()
     return jsonify({"error": "deserialization disabled"}), 400
 
 
 @app.route("/config", methods=["POST"])
 def load_config():
-    # VULN: INSECURE DESERIALIZATION — yaml.load with unsafe Loader on user input.
     data = request.get_data(as_text=True)
-    cfg = yaml.safe_load(data)  # VULN: unsafe yaml.load
+    try:
+        cfg = yaml.safe_load(data)
+    except yaml.YAMLError:
+        return jsonify({"error": "invalid config"}), 400
     return jsonify({"config": str(cfg)})
 
 
 @app.route("/fetch")
 def fetch_url():
-    # VULN: SSRF — fetches any user-supplied URL with no destination validation.
     url = request.args.get("url", "")
     
     # Validate URL scheme
@@ -115,28 +110,23 @@ def fetch_url():
     
     # Check for loopback/private ranges
     if parsed.hostname:
+        import ipaddress
+        import socket
+
+        # Resolve hostname and check all resolved addresses
         try:
-            import ipaddress
-            import socket
-            
-            # Resolve hostname and check all resolved addresses
-            try:
-                addr_info = socket.getaddrinfo(parsed.hostname, None)
-                for addr_tuple in addr_info:
-                    addr = addr_tuple[4][0]
-                    ip_addr = ipaddress.ip_address(addr)
-                    if (ip_addr.is_loopback or 
-                        ip_addr.is_private or 
-                        ip_addr.is_link_local or 
-                        ip_addr.is_multicast or
-                        ip_addr.is_reserved):
-                        return jsonify({"error": "invalid host"}), 400
-            except Exception:
-                # If DNS resolution fails, reject the request
-                return jsonify({"error": "invalid host"}), 400
-                
-        except ValueError:
-            # If hostname is not an IP and DNS resolution fails, reject it
+            addr_info = socket.getaddrinfo(parsed.hostname, None)
+            for addr_tuple in addr_info:
+                addr = addr_tuple[4][0]
+                ip_addr = ipaddress.ip_address(addr)
+                if (ip_addr.is_loopback or 
+                    ip_addr.is_private or 
+                    ip_addr.is_link_local or 
+                    ip_addr.is_multicast or
+                    ip_addr.is_reserved):
+                    return jsonify({"error": "invalid host"}), 400
+        except Exception:
+            # If DNS resolution fails, reject the request
             return jsonify({"error": "invalid host"}), 400
     
     try:
