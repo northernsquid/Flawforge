@@ -2,7 +2,11 @@
 # Each route plants exactly one labeled vulnerability for pipeline testing.
 import os
 import sqlite3
-import urllib.request
+import http.client
+import ipaddress
+import socket
+import ssl
+import urllib.parse
 import yaml
 import hmac
 from flask import Flask, request, jsonify, g
@@ -96,45 +100,65 @@ def load_config():
     return jsonify({"config": str(cfg)})
 
 
+# NAT64 (64:ff9b::/96, 64:ff9b:1::/48), IPv4-compatible (::/96), SIIT (::ffff:0:0:0/96)
+# and site-local (fec0::/10) can embed a non-global IPv4 yet report is_global.
+BLOCKED_IPV6_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "64:ff9b::/96", "64:ff9b:1::/48", "::/96", "::ffff:0:0:0/96", "fec0::/10",
+))
+
+
 @app.route("/fetch")
 def fetch_url():
     url = request.args.get("url", "")
-    
+
     # Validate URL scheme
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "invalid scheme"}), 400
-    
-    # Parse URL to check for private/loopback addresses
-    import urllib.parse
-    parsed = urllib.parse.urlparse(url)
-    
-    # Check for loopback/private ranges
-    if parsed.hostname:
-        import ipaddress
-        import socket
 
-        # Resolve hostname and check all resolved addresses
-        try:
-            addr_info = socket.getaddrinfo(parsed.hostname, None)
-            for addr_tuple in addr_info:
-                addr = addr_tuple[4][0]
-                ip_addr = ipaddress.ip_address(addr)
-                if (ip_addr.is_loopback or 
-                    ip_addr.is_private or 
-                    ip_addr.is_link_local or 
-                    ip_addr.is_multicast or
-                    ip_addr.is_reserved):
-                    return jsonify({"error": "invalid host"}), 400
-        except Exception:
-            # If DNS resolution fails, reject the request
-            return jsonify({"error": "invalid host"}), 400
-    
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:  # nosemgrep
-            body = resp.read(4096)
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return jsonify({"error": "invalid host"}), 400
+    if not hostname or port == 0:
+        return jsonify({"error": "invalid host"}), 400
+
+    # Resolve once; every address must be public. Connect only to a checked IP.
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        ips = [ipaddress.ip_address(a[4][0].split("%")[0]) for a in addr_info]
+    except (OSError, ValueError, UnicodeError):
+        return jsonify({"error": "invalid host"}), 400
+    if not ips:
+        return jsonify({"error": "invalid host"}), 400
+    for ip in ips:
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if not ip.is_global or ip.is_multicast or (mapped and not mapped.is_global):
+            return jsonify({"error": "invalid host"}), 400
+        if ip.version == 6 and any(ip in net for net in BLOCKED_IPV6_NETWORKS):
+            return jsonify({"error": "invalid host"}), 400
+
+    host_header = f"[{hostname}]" if ":" in hostname else hostname
+    if parsed.port and parsed.port != (443 if parsed.scheme == "https" else 80):
+        host_header += f":{parsed.port}"
+    path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+
+    conn = http.client.HTTPConnection(str(ips[0]), port, timeout=5)
+    try:
+        conn.sock = socket.create_connection((str(ips[0]), port), timeout=5)
+        if parsed.scheme == "https":
+            conn.sock = ssl.create_default_context().wrap_socket(conn.sock, server_hostname=hostname)
+        conn.request("GET", path, headers={"Host": host_header})
+        resp = conn.getresponse()
+        if 300 <= resp.status < 400:
+            return jsonify({"error": "redirect refused"}), 400
+        body = resp.read(4096)
         return jsonify({"url": url, "body": body.decode("utf-8", "replace")})
     except Exception:
         return jsonify({"error": "fetch failed"}), 400
+    finally:
+        conn.close()
 
 
 @app.route("/")
